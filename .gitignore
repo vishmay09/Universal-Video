@@ -1,0 +1,11 @@
+.env
+venv/
+__pycache__/
+*.pyc
+.gradio/
+video_processing_workspace/
+video_processing_workspace1/
+input_folder/
+output_folder/
+ffmpeg_bin/
+.claude/
