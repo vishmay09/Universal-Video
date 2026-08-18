@@ -1645,10 +1645,15 @@ if __name__ == "__main__":
     # there. Running locally still gets a temporary public share link.
     running_on_spaces = bool(os.environ.get("SPACE_ID"))
 
+    import os
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 7860))
+
     app.launch(
-    server_name="0.0.0.0",
-    server_port=int(os.environ.get("PORT", 7860)),
-    share=False,
-    show_error=True,
-    debug=True,
-)
+        server_name="0.0.0.0",
+        server_port=port,
+        share=False,
+        show_error=True,
+        debug=False,
+    )
