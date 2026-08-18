@@ -1646,9 +1646,9 @@ if __name__ == "__main__":
     running_on_spaces = bool(os.environ.get("SPACE_ID"))
 
     app.launch(
-        server_name="0.0.0.0" if running_on_spaces else None,
-        server_port=int(os.environ.get("PORT", 7860)),
-        share=not running_on_spaces,
-        show_error=True,
-        debug=True,
-    )
+    server_name="0.0.0.0",
+    server_port=int(os.environ.get("PORT", 7860)),
+    share=False,
+    show_error=True,
+    debug=True,
+)
