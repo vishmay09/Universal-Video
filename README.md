@@ -3,9 +3,6 @@ title: Universal Video Processor
 emoji: 🎬
 colorFrom: indigo
 colorTo: blue
-sdk: docker
-app_port: 7860
-pinned: false
 ---
 
 # Universal Video Processor
@@ -28,26 +25,26 @@ then run:
 python final1.py
 ```
 
-## Deploying on Hugging Face Spaces
+## Deploying on Render (free, no credit card)
 
-This repo is set up as a **Docker** Space so the build installs exactly what's
-in `Dockerfile`/`requirements.txt` - nothing more (no GPU-tier packages
-auto-injected, so it runs on the free CPU Basic hardware with no restrictions).
+This repo ships a `Dockerfile` that installs `ffmpeg` via `apt-get` plus all
+Python deps, so Render builds and runs it exactly as-is.
 
-1. Create a new Space with SDK = **Docker** (hardware defaults to free
-   CPU Basic for Docker Spaces - no manual hardware unlock needed).
-2. Push this repo's contents (`Dockerfile`, `final1.py`, `requirements.txt`,
-   this `README.md`) to the Space's git remote.
-3. In the Space's **Settings -> Variables and secrets**, add:
+1. Push this repo to GitHub.
+2. On [render.com](https://render.com), create a **New Web Service** and
+   connect this GitHub repo.
+3. Runtime: **Docker** (Render detects the `Dockerfile` automatically).
+4. Instance type: **Free**.
+5. Under **Environment**, add:
    - `CLOUDINARY_CLOUD_NAME`
    - `CLOUDINARY_API_KEY`
    - `CLOUDINARY_API_SECRET`
-4. The Space builds the Dockerfile automatically and gives you a permanent
-   public URL (`https://huggingface.co/spaces/<you>/<space-name>`) that stays
-   up without your machine needing to run anything.
+6. Deploy. Render builds the Dockerfile and gives you a permanent public URL
+   (`https://<service-name>.onrender.com`).
 
-The `Dockerfile` installs `ffmpeg` via `apt-get`, which this app requires for
-all video conversions.
+Free-tier services sleep after 15 minutes of inactivity and wake up
+automatically (~30-60s cold start) on the next visit - otherwise this stays
+live indefinitely at no cost.
 
 Never commit real Cloudinary credentials into this repo - always set them as
-Space secrets or in a local, git-ignored `.env` file.
+Render environment variables or in a local, git-ignored `.env` file.
