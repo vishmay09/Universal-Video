@@ -1,5 +1,4 @@
 gradio==4.26.0
-ffmpeg-python==0.2.1
 pillow==10.1.0
 tqdm==4.66.1
 cloudinary==1.40.0
