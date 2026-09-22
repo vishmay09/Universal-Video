@@ -3,6 +3,8 @@ import io
 import shutil
 import subprocess
 import tempfile
+import threading
+import time
 import zipfile
 from datetime import datetime
 from pathlib import Path
@@ -361,17 +363,31 @@ def cleanup_passlog(passlog_base):
             pass
 
 
-def run_ffmpeg_with_progress(cmd, duration, progress_start, progress_span, progress_callback, desc_prefix, timeout=3600):
+def run_ffmpeg_with_progress(cmd, duration, progress_start, progress_span, progress_callback, desc_prefix,
+                              stall_timeout=180, hard_timeout=1800):
     """
     Runs an ffmpeg command (which must include "-progress pipe:1") and
-    reports live sub-progress instead of the caller's progress bar freezing
-    at one number for the whole duration of the pass. stderr is merged into
-    the same pipe as stdout (not read separately) specifically to avoid a
-    classic subprocess deadlock: ffmpeg writes a lot of its own log output
-    to stderr, and if that pipe fills up while we're only draining stdout,
-    ffmpeg blocks trying to write to it - which would also silently stop
-    the progress lines we're waiting for, hanging this function forever.
+    reports live sub-progress with elapsed time instead of the caller's
+    progress bar freezing at one number for the whole pass. stderr is
+    merged into the same pipe as stdout (not read separately) specifically
+    to avoid a classic subprocess deadlock: ffmpeg writes a lot of its own
+    log output to stderr, and if that pipe fills up while we're only
+    draining stdout, ffmpeg blocks trying to write to it - which would also
+    silently stop the progress lines we're waiting for.
+
+    Two independent safety nets, because "for line in process.stdout" has
+    NO timeout of its own - a genuinely hung ffmpeg would otherwise block
+    here forever with no way to recover, wasting the host's CPU/memory
+    indefinitely and leaving the user staring at a dead progress bar:
+      - stall_timeout: killed if no new progress line arrives for this long
+        (a real hang, not just a slow encode - slow encodes keep producing
+        lines, just with small jumps in percentage).
+      - hard_timeout: killed if the whole pass runs longer than this,
+        regardless of whether it's still making progress.
+
     Returns (returncode, last ~4000 chars of output for error reporting).
+    A returncode of -1 means this function killed the process itself
+    (stalled or hit the hard cap), not that ffmpeg exited with -1.
     """
     process = subprocess.Popen(
         cmd,
@@ -383,28 +399,72 @@ def run_ffmpeg_with_progress(cmd, duration, progress_start, progress_span, progr
 
     output_tail = []
     out_time_seconds = 0.0
+    start_time = time.monotonic()
+    stall_state = {"killed": False}
 
-    for line in process.stdout:
-        output_tail.append(line)
-        if len(output_tail) > 200:
-            output_tail.pop(0)
+    def kill_for_stall():
+        stall_state["killed"] = True
+        try:
+            process.kill()
+        except Exception:
+            pass
 
-        line = line.strip()
-        if line.startswith("out_time_ms="):
-            try:
-                out_time_seconds = int(line.split("=", 1)[1]) / 1_000_000
-            except ValueError:
-                pass
+    watchdog = threading.Timer(stall_timeout, kill_for_stall)
+    watchdog.daemon = True
+    watchdog.start()
 
-        if progress_callback and duration > 0:
-            frac = min(out_time_seconds / duration, 1.0)
-            try:
-                progress_callback(progress_start + progress_span * frac, desc=f"{desc_prefix} ({frac * 100:.0f}%)")
-            except Exception:
-                pass
+    hard_timeout_hit = False
 
-    process.wait(timeout=timeout)
-    return process.returncode, "".join(output_tail)[-4000:]
+    try:
+        for line in process.stdout:
+            watchdog.cancel()
+
+            output_tail.append(line)
+            if len(output_tail) > 200:
+                output_tail.pop(0)
+
+            stripped = line.strip()
+            if stripped.startswith("out_time_ms="):
+                try:
+                    out_time_seconds = int(stripped.split("=", 1)[1]) / 1_000_000
+                except ValueError:
+                    pass
+
+            elapsed = time.monotonic() - start_time
+
+            if progress_callback and duration > 0:
+                frac = min(out_time_seconds / duration, 1.0)
+                try:
+                    progress_callback(
+                        progress_start + progress_span * frac,
+                        desc=f"{desc_prefix} ({frac * 100:.0f}%, {int(elapsed)}s elapsed)",
+                    )
+                except Exception:
+                    pass
+
+            if elapsed > hard_timeout:
+                hard_timeout_hit = True
+                try:
+                    process.kill()
+                except Exception:
+                    pass
+                break
+
+            watchdog = threading.Timer(stall_timeout, kill_for_stall)
+            watchdog.daemon = True
+            watchdog.start()
+    finally:
+        watchdog.cancel()
+
+    process.wait(timeout=30)
+    tail_text = "".join(output_tail)[-4000:]
+
+    if stall_state["killed"]:
+        return -1, f"ffmpeg produced no progress for {stall_timeout}s and was stopped (stalled). {tail_text}"
+    if hard_timeout_hit:
+        return -1, f"ffmpeg exceeded the {hard_timeout}s time limit and was stopped. {tail_text}"
+
+    return process.returncode, tail_text
 
 
 def compress_video_to_target_size(input_path, output_path, target_size_mb, progress_callback=None):
