@@ -411,9 +411,14 @@ def run_ffmpeg_with_progress(cmd, duration, progress_start, progress_span, progr
 
     Two independent safety nets, because "for line in process.stdout" has
     NO timeout of its own:
-      - stall_timeout: killed if no new progress line arrives for this long
-        (a real hang, not just a slow encode).
-      - hard_timeout: killed if the whole pass runs longer than this.
+      - stall_timeout: killed if out_time (real encoding progress) hasn't
+        actually advanced for this long. This deliberately does NOT reset
+        on every line - ffmpeg can keep emitting periodic "-progress"
+        heartbeat lines even while genuinely stuck (e.g. a filter/codec
+        issue with a specific input file), which would otherwise mask a
+        real hang forever behind an elapsed counter that looks alive.
+      - hard_timeout: killed if the whole pass runs longer than this
+        regardless of whether it's still progressing.
 
     Returns (returncode, last ~4000 chars of output for error reporting).
     A returncode of -1 means this function killed the process itself.
@@ -428,6 +433,7 @@ def run_ffmpeg_with_progress(cmd, duration, progress_start, progress_span, progr
 
     output_tail = []
     out_time_seconds = 0.0
+    last_progress_out_time = -1.0
     start_time = time.monotonic()
     stall_state = {"killed": False}
 
@@ -446,8 +452,6 @@ def run_ffmpeg_with_progress(cmd, duration, progress_start, progress_span, progr
 
     try:
         for line in process.stdout:
-            watchdog.cancel()
-
             output_tail.append(line)
             if len(output_tail) > 200:
                 output_tail.pop(0)
@@ -459,6 +463,15 @@ def run_ffmpeg_with_progress(cmd, duration, progress_start, progress_span, progr
                 except ValueError:
                     pass
 
+            # Only reset the stall watchdog when out_time has genuinely
+            # advanced, not on every heartbeat line - see docstring.
+            if out_time_seconds > last_progress_out_time:
+                last_progress_out_time = out_time_seconds
+                watchdog.cancel()
+                watchdog = threading.Timer(stall_timeout, kill_for_stall)
+                watchdog.daemon = True
+                watchdog.start()
+
             elapsed = time.monotonic() - start_time
 
             if progress_callback and duration > 0:
@@ -466,7 +479,7 @@ def run_ffmpeg_with_progress(cmd, duration, progress_start, progress_span, progr
                 try:
                     progress_callback(
                         progress_start + progress_span * frac,
-                        desc=f"{desc_prefix} ({frac * 100:.0f}%, {int(elapsed)}s elapsed)",
+                        desc=f"{desc_prefix} ({frac * 100:.1f}%, {int(elapsed)}s elapsed / ~{int(duration)}s total)",
                     )
                 except Exception:
                     pass
@@ -478,10 +491,6 @@ def run_ffmpeg_with_progress(cmd, duration, progress_start, progress_span, progr
                 except Exception:
                     pass
                 break
-
-            watchdog = threading.Timer(stall_timeout, kill_for_stall)
-            watchdog.daemon = True
-            watchdog.start()
     finally:
         watchdog.cancel()
 
