@@ -1,0 +1,190 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Video & Image Compressor</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <div class="header">
+    <h1>🗜️ Video &amp; Image Compressor</h1>
+    <p>Shrink files to a target size while keeping the best quality that size budget allows</p>
+  </div>
+
+  <div class="container">
+    <div class="tabs">
+      <button class="tab-btn active" data-tab="video">🎥 Video Compressor</button>
+      <button class="tab-btn" data-tab="image">🖼️ Image Compressor</button>
+      <button class="tab-btn" data-tab="batch-video">📦 Batch Video</button>
+      <button class="tab-btn" data-tab="batch-image">📦 Batch Image</button>
+      <button class="tab-btn" data-tab="library">☁️ Cloud Library</button>
+    </div>
+
+    <!-- ===================== VIDEO ===================== -->
+    <div class="tab-panel active" id="tab-video">
+      <div class="card">
+        <div class="row">
+          <div class="col">
+            <label class="field-label">Input</label>
+            <label class="dropzone" id="video-drop">
+              <span>Click or drop a video</span>
+              <input type="file" id="video-input" accept="video/*">
+            </label>
+          </div>
+          <div class="col">
+            <label class="field-label">Compressed Output</label>
+            <div class="preview-box" id="video-output-box"><span>Output appears here</span></div>
+          </div>
+        </div>
+
+        <label class="field-label" style="margin-top:16px;">Target Size</label>
+        <div class="size-options" data-group="video-size">
+          <button class="size-btn active" data-value="10mb">Under 10 MB</button>
+          <button class="size-btn" data-value="5mb">Under 5 MB</button>
+          <button class="size-btn" data-value="custom">Custom (MB)</button>
+        </div>
+        <div id="video-custom-wrap" style="display:none; margin-bottom:12px;">
+          <input type="number" id="video-custom-mb" placeholder="Custom size in MB" min="0.1" step="0.1" value="10">
+        </div>
+
+        <button class="btn-primary" id="video-compress-btn">🗜️ Compress Video</button>
+
+        <div class="progress-wrap" id="video-progress">
+          <div class="progress-desc" id="video-progress-desc">Starting...</div>
+          <div class="progress-track"><div class="progress-fill" id="video-progress-fill"></div></div>
+        </div>
+
+        <div class="status-box" id="video-status"></div>
+        <div class="download-row" id="video-downloads"></div>
+      </div>
+    </div>
+
+    <!-- ===================== IMAGE ===================== -->
+    <div class="tab-panel" id="tab-image">
+      <div class="card">
+        <div class="row">
+          <div class="col">
+            <label class="field-label">Input</label>
+            <label class="dropzone" id="image-drop">
+              <span>Click or drop an image</span>
+              <input type="file" id="image-input" accept="image/*">
+            </label>
+          </div>
+          <div class="col">
+            <label class="field-label">Compressed Output</label>
+            <div class="preview-box" id="image-output-box"><span>Output appears here</span></div>
+          </div>
+        </div>
+
+        <label class="field-label" style="margin-top:16px;">Target Size</label>
+        <div class="size-options" data-group="image-size">
+          <button class="size-btn active" data-value="500kb">Under 500 KB</button>
+          <button class="size-btn" data-value="200kb">Under 200 KB</button>
+          <button class="size-btn" data-value="custom">Custom (KB)</button>
+        </div>
+        <div id="image-custom-wrap" style="display:none; margin-bottom:12px;">
+          <input type="number" id="image-custom-kb" placeholder="Custom size in KB" min="1" step="1" value="200">
+        </div>
+
+        <button class="btn-primary" id="image-compress-btn">🗜️ Compress Image</button>
+
+        <div class="progress-wrap" id="image-progress">
+          <div class="progress-desc" id="image-progress-desc">Starting...</div>
+          <div class="progress-track"><div class="progress-fill" id="image-progress-fill"></div></div>
+        </div>
+
+        <div class="status-box" id="image-status"></div>
+        <div class="download-row" id="image-downloads"></div>
+      </div>
+    </div>
+
+    <!-- ===================== BATCH VIDEO ===================== -->
+    <div class="tab-panel" id="tab-batch-video">
+      <div class="card">
+        <p class="hint">Upload up to 100 videos at once. Each is compressed to your target size;
+          videos already at or under the target are copied through unchanged instead of being
+          re-encoded. Download everything as one ZIP when done.</p>
+
+        <label class="field-label">Videos</label>
+        <label class="dropzone" id="batch-video-drop" style="height:120px;">
+          <span id="batch-video-drop-text">Click or drop multiple videos</span>
+          <input type="file" id="batch-video-input" accept="video/*" multiple>
+        </label>
+        <div class="file-count-badge" id="batch-video-count"></div>
+
+        <label class="field-label" style="margin-top:16px;">Target Size (per video)</label>
+        <div class="size-options" data-group="batch-video-size">
+          <button class="size-btn active" data-value="10mb">Under 10 MB</button>
+          <button class="size-btn" data-value="5mb">Under 5 MB</button>
+          <button class="size-btn" data-value="custom">Custom (MB)</button>
+        </div>
+        <div id="batch-video-custom-wrap" style="display:none; margin-bottom:12px;">
+          <input type="number" id="batch-video-custom-mb" placeholder="Custom size in MB" min="0.1" step="0.1" value="10">
+        </div>
+
+        <button class="btn-primary" id="batch-video-compress-btn">🗜️ Start Batch Compression</button>
+
+        <div class="progress-wrap" id="batch-video-progress">
+          <div class="progress-desc" id="batch-video-progress-desc">Starting...</div>
+          <div class="progress-track"><div class="progress-fill" id="batch-video-progress-fill"></div></div>
+        </div>
+
+        <div class="status-box" id="batch-video-status"></div>
+        <div class="batch-list" id="batch-video-list"></div>
+        <div class="download-row" id="batch-video-downloads"></div>
+      </div>
+    </div>
+
+    <!-- ===================== BATCH IMAGE ===================== -->
+    <div class="tab-panel" id="tab-batch-image">
+      <div class="card">
+        <p class="hint">Upload up to 100 images at once. Each is compressed to your target size;
+          images already at or under the target are copied through unchanged instead of being
+          re-encoded. Download everything as one ZIP when done.</p>
+
+        <label class="field-label">Images</label>
+        <label class="dropzone" id="batch-image-drop" style="height:120px;">
+          <span id="batch-image-drop-text">Click or drop multiple images</span>
+          <input type="file" id="batch-image-input" accept="image/*" multiple>
+        </label>
+        <div class="file-count-badge" id="batch-image-count"></div>
+
+        <label class="field-label" style="margin-top:16px;">Target Size (per image)</label>
+        <div class="size-options" data-group="batch-image-size">
+          <button class="size-btn active" data-value="500kb">Under 500 KB</button>
+          <button class="size-btn" data-value="200kb">Under 200 KB</button>
+          <button class="size-btn" data-value="custom">Custom (KB)</button>
+        </div>
+        <div id="batch-image-custom-wrap" style="display:none; margin-bottom:12px;">
+          <input type="number" id="batch-image-custom-kb" placeholder="Custom size in KB" min="1" step="1" value="200">
+        </div>
+
+        <button class="btn-primary" id="batch-image-compress-btn">🗜️ Start Batch Compression</button>
+
+        <div class="progress-wrap" id="batch-image-progress">
+          <div class="progress-desc" id="batch-image-progress-desc">Starting...</div>
+          <div class="progress-track"><div class="progress-fill" id="batch-image-progress-fill"></div></div>
+        </div>
+
+        <div class="status-box" id="batch-image-status"></div>
+        <div class="batch-list" id="batch-image-list"></div>
+        <div class="download-row" id="batch-image-downloads"></div>
+      </div>
+    </div>
+
+    <!-- ===================== LIBRARY ===================== -->
+    <div class="tab-panel" id="tab-library">
+      <div class="card">
+        <p class="hint">Every compressed file is uploaded to Cloudinary for permanent storage -
+          local disk on a host like Render is wiped on every restart/redeploy, so this is what
+          survives. Browse and open past results here anytime.</p>
+        <button class="btn-secondary" id="library-refresh-btn">🔄 Refresh</button>
+        <div id="library-content" style="margin-top:14px;"></div>
+      </div>
+    </div>
+  </div>
+
+  <script src="/app.js"></script>
+</body>
+</html>

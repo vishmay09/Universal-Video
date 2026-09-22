@@ -13,6 +13,7 @@ COPY . .
 
 RUN mkdir -p video_processing_workspace/Compressed_Videos \
              video_processing_workspace/Compressed_Images \
+             video_processing_workspace/Uploads \
              video_processing_workspace/Logs && \
     chmod -R 777 video_processing_workspace
 
@@ -20,4 +21,4 @@ EXPOSE 7860
 
 ENV PORT=7860
 
-CMD ["python", "final.py"]
+CMD ["python", "app.py"]

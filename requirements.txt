@@ -1,4 +1,6 @@
-gradio==6.24.0
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+python-multipart==0.0.20
 pillow==10.1.0
 cloudinary==1.40.0
 python-dotenv==1.0.1
