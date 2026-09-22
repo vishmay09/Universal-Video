@@ -11,6 +11,16 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import gradio as gr
 from PIL import Image
 
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
+import cloudinary
+import cloudinary.uploader
+import cloudinary.api
+
 # ==============================
 # FFMPEG / FFPROBE LOCATION
 # ==============================
@@ -86,6 +96,72 @@ IMAGE_SIZE_PRESETS = {
 BATCH_VIDEO_MAX_WORKERS = max(1, min(3, os.cpu_count() or 2))
 BATCH_IMAGE_MAX_WORKERS = max(1, min(8, (os.cpu_count() or 4) * 2))
 MAX_BATCH_FILES = 100
+
+# ==============================
+# CLOUDINARY (PERSISTENT STORAGE)
+# ==============================
+# Render's (and most container hosts') filesystem is ephemeral - anything
+# written locally is wiped on every restart or redeploy. Cloudinary gives
+# every compressed file a permanent, shareable URL that survives that, and
+# doubles as the "database" the Cloud Library tab reads back from.
+# Credentials come from environment variables only - never hardcode them.
+# Locally, put them in a .env file (loaded above); on Render, set them
+# under the service's Environment tab as secrets.
+
+CLOUDINARY_CLOUD_NAME = os.environ.get("CLOUDINARY_CLOUD_NAME", "")
+CLOUDINARY_API_KEY = os.environ.get("CLOUDINARY_API_KEY", "")
+CLOUDINARY_API_SECRET = os.environ.get("CLOUDINARY_API_SECRET", "")
+
+CLOUDINARY_CONFIGURED = bool(
+    CLOUDINARY_CLOUD_NAME and CLOUDINARY_API_KEY and CLOUDINARY_API_SECRET
+)
+
+if CLOUDINARY_CONFIGURED:
+    cloudinary.config(
+        cloud_name=CLOUDINARY_CLOUD_NAME,
+        api_key=CLOUDINARY_API_KEY,
+        api_secret=CLOUDINARY_API_SECRET,
+        secure=True,
+    )
+
+CLOUDINARY_VIDEO_FOLDER = "video_image_compressor/videos"
+CLOUDINARY_IMAGE_FOLDER = "video_image_compressor/images"
+
+
+def upload_to_cloudinary(file_path, resource_type, folder):
+    """
+    Uploads a compressed file to Cloudinary for permanent storage. Returns
+    {success, url, public_id, error}. Never raises - a failed/absent upload
+    just means the file stays local-only for this session, it never blocks
+    the compression result itself.
+    """
+    if not CLOUDINARY_CONFIGURED:
+        return {"success": False, "url": None, "public_id": None,
+                "error": "Cloudinary not configured (missing env vars)."}
+
+    if not file_path or not os.path.exists(file_path):
+        return {"success": False, "url": None, "public_id": None, "error": "File not found."}
+
+    try:
+        if resource_type == "video":
+            result = cloudinary.uploader.upload_large(
+                str(file_path), resource_type="video", folder=folder,
+                use_filename=True, unique_filename=True, overwrite=False,
+            )
+        else:
+            result = cloudinary.uploader.upload(
+                str(file_path), resource_type="image", folder=folder,
+                use_filename=True, unique_filename=True, overwrite=False,
+            )
+        return {
+            "success": True,
+            "url": result.get("secure_url"),
+            "public_id": result.get("public_id"),
+            "error": "",
+        }
+    except Exception as e:
+        return {"success": False, "url": None, "public_id": None, "error": str(e)}
+
 
 # ==============================
 # HELPERS
@@ -165,6 +241,22 @@ def create_zip(zip_name, file_paths):
             used_names.add(arcname)
             zf.write(file_path, arcname=arcname)
     return str(zip_path)
+
+
+def build_links_manifest(results):
+    """
+    Writes a plain-text manifest of each batch file's permanent Cloudinary
+    URL (when it has one) to a temp file, to be bundled into the ZIP.
+    Returns None if there's nothing to write (Cloudinary not configured,
+    or every upload failed) so callers can skip it cleanly.
+    """
+    lines = [f"{r['name']} -> {r['cloud_url']}" for r in results if r.get("cloud_url")]
+    if not lines:
+        return None
+
+    manifest_path = Path(tempfile.gettempdir()) / f"cloudinary_links_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+    manifest_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return str(manifest_path)
 
 
 def get_video_duration(video_path):
@@ -502,10 +594,11 @@ def batch_compress_one_video(input_path, target_mb):
         if original_size <= target_mb:
             out_path = unique_path(COMPRESSED_VIDEO_FOLDER, f"{clean_stem(input_path)}{input_path.suffix}")
             shutil.copy2(input_path, out_path)
+            upload = upload_to_cloudinary(out_path, "video", CLOUDINARY_VIDEO_FOLDER)
             return {
                 "name": name, "success": True, "action": "copied (already under target)",
                 "original_size_mb": round(original_size, 2), "final_size_mb": round(original_size, 2),
-                "output_path": str(out_path), "error": "",
+                "output_path": str(out_path), "cloud_url": upload.get("url"), "error": "",
             }
 
         size_tag = str(int(target_mb)) if target_mb == int(target_mb) else str(target_mb).replace(".", "_")
@@ -513,23 +606,25 @@ def batch_compress_one_video(input_path, target_mb):
         result = compress_video_to_target_size(input_path, out_path, target_mb)
 
         if result.get("success"):
+            upload = upload_to_cloudinary(out_path, "video", CLOUDINARY_VIDEO_FOLDER)
             return {
                 "name": name, "success": True, "action": "compressed",
                 "original_size_mb": round(original_size, 2), "final_size_mb": result["size_mb"],
-                "output_path": str(out_path), "error": "",
+                "output_path": str(out_path), "cloud_url": upload.get("url"), "error": "",
             }
 
         return {
             "name": name, "success": False, "action": "failed",
             "original_size_mb": round(original_size, 2), "final_size_mb": None,
-            "output_path": None, "error": result.get("error", "Unknown error"),
+            "output_path": None, "cloud_url": None, "error": result.get("error", "Unknown error"),
         }
 
     except Exception as e:
         safe_log(f"Batch video error ({name}): {str(e)}", "ERROR")
         return {
             "name": name, "success": False, "action": "failed",
-            "original_size_mb": 0, "final_size_mb": None, "output_path": None, "error": str(e),
+            "original_size_mb": 0, "final_size_mb": None, "output_path": None,
+            "cloud_url": None, "error": str(e),
         }
 
 
@@ -548,10 +643,11 @@ def batch_compress_one_image(input_path, target_kb):
         if original_size <= target_kb:
             out_path = unique_path(COMPRESSED_IMAGE_FOLDER, f"{clean_stem(input_path)}{input_path.suffix}")
             shutil.copy2(input_path, out_path)
+            upload = upload_to_cloudinary(out_path, "image", CLOUDINARY_IMAGE_FOLDER)
             return {
                 "name": name, "success": True, "action": "copied (already under target)",
                 "original_size_kb": round(original_size, 2), "final_size_kb": round(original_size, 2),
-                "output_path": str(out_path), "error": "",
+                "output_path": str(out_path), "cloud_url": upload.get("url"), "error": "",
             }
 
         size_tag = str(int(target_kb)) if target_kb == int(target_kb) else str(target_kb).replace(".", "_")
@@ -561,23 +657,25 @@ def batch_compress_one_image(input_path, target_kb):
         result = compress_image_to_target_size(input_path, out_path, target_kb)
 
         if result.get("success"):
+            upload = upload_to_cloudinary(out_path, "image", CLOUDINARY_IMAGE_FOLDER)
             return {
                 "name": name, "success": True, "action": "compressed",
                 "original_size_kb": round(original_size, 2), "final_size_kb": result["size_kb"],
-                "output_path": str(out_path), "error": "",
+                "output_path": str(out_path), "cloud_url": upload.get("url"), "error": "",
             }
 
         return {
             "name": name, "success": False, "action": "failed",
             "original_size_kb": round(original_size, 2), "final_size_kb": None,
-            "output_path": None, "error": result.get("error", "Unknown error"),
+            "output_path": None, "cloud_url": None, "error": result.get("error", "Unknown error"),
         }
 
     except Exception as e:
         safe_log(f"Batch image error ({name}): {str(e)}", "ERROR")
         return {
             "name": name, "success": False, "action": "failed",
-            "original_size_kb": 0, "final_size_kb": None, "output_path": None, "error": str(e),
+            "original_size_kb": 0, "final_size_kb": None, "output_path": None,
+            "cloud_url": None, "error": str(e),
         }
 
 
@@ -646,6 +744,13 @@ def process_compress_video_ui(video_path, size_choice, custom_mb, progress=gr.Pr
     status_text += f"Encoding Passes Used: {result['attempts']}\n"
     status_text += f"Location: {output_path}\n"
 
+    on_progress(1.0, "Uploading to Cloudinary...")
+    upload = upload_to_cloudinary(output_path, "video", CLOUDINARY_VIDEO_FOLDER)
+    if upload["success"]:
+        status_text += f"\nCloudinary URL (permanent): {upload['url']}\n"
+    else:
+        status_text += f"\nCloudinary upload skipped: {upload['error']}\n"
+
     return status_text, str(output_path), str(output_path)
 
 
@@ -709,6 +814,16 @@ def process_compress_image_ui(image_path, size_choice, custom_kb, progress=gr.Pr
     status_text += f"Output Resolution: {result['output_resolution']}"
     status_text += " (downscaled to fit the size budget)\n" if result["output_resolution"] != result["original_resolution"] else " (unchanged)\n"
     status_text += f"Location: {output_path}\n"
+
+    try:
+        progress(1.0, desc="Uploading to Cloudinary...")
+    except Exception:
+        pass
+    upload = upload_to_cloudinary(output_path, "image", CLOUDINARY_IMAGE_FOLDER)
+    if upload["success"]:
+        status_text += f"\nCloudinary URL (permanent): {upload['url']}\n"
+    else:
+        status_text += f"\nCloudinary upload skipped: {upload['error']}\n"
 
     return status_text, str(output_path), str(output_path)
 
@@ -780,6 +895,8 @@ def process_batch_videos_ui(video_files, size_choice, custom_mb, progress=gr.Pro
         status_text += f"[{idx}/{total}] {r['name']}\n"
         if r["success"]:
             status_text += f"    {r['action'].upper()} - {r['original_size_mb']} MB -> {r['final_size_mb']} MB\n"
+            if r.get("cloud_url"):
+                status_text += f"    Cloudinary: {r['cloud_url']}\n"
         else:
             status_text += f"    FAILED - {r['error']}\n"
 
@@ -787,11 +904,20 @@ def process_batch_videos_ui(video_files, size_choice, custom_mb, progress=gr.Pro
     status_text += "BATCH COMPLETE\n"
     status_text += "=" * 60 + "\n"
     status_text += f"Compressed: {compressed_count} | Copied (already small): {copied_count} | Failed: {failed_count}\n"
+    if CLOUDINARY_CONFIGURED:
+        uploaded_count = sum(1 for r in results if r.get("cloud_url"))
+        status_text += f"Uploaded to Cloudinary (permanent storage): {uploaded_count}/{success_count}\n"
+    else:
+        status_text += "Cloudinary not configured - files only saved to local (ephemeral) disk.\n"
 
     output_files = [r["output_path"] for r in results if r["success"]]
     zip_path = None
     if output_files:
-        zip_path = create_zip(f"batch_videos_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip", output_files)
+        manifest_path = build_links_manifest(results)
+        zip_path = create_zip(
+            f"batch_videos_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip",
+            output_files + ([manifest_path] if manifest_path else []),
+        )
         status_text += f"\nZIP ready for download ({len(output_files)} files).\n"
     else:
         status_text += "\nNo files were successfully processed - nothing to zip.\n"
@@ -849,6 +975,8 @@ def process_batch_images_ui(image_files, size_choice, custom_kb, progress=gr.Pro
         status_text += f"[{idx}/{total}] {r['name']}\n"
         if r["success"]:
             status_text += f"    {r['action'].upper()} - {r['original_size_kb']} KB -> {r['final_size_kb']} KB\n"
+            if r.get("cloud_url"):
+                status_text += f"    Cloudinary: {r['cloud_url']}\n"
         else:
             status_text += f"    FAILED - {r['error']}\n"
 
@@ -856,16 +984,94 @@ def process_batch_images_ui(image_files, size_choice, custom_kb, progress=gr.Pro
     status_text += "BATCH COMPLETE\n"
     status_text += "=" * 60 + "\n"
     status_text += f"Compressed: {compressed_count} | Copied (already small): {copied_count} | Failed: {failed_count}\n"
+    if CLOUDINARY_CONFIGURED:
+        uploaded_count = sum(1 for r in results if r.get("cloud_url"))
+        status_text += f"Uploaded to Cloudinary (permanent storage): {uploaded_count}/{success_count}\n"
+    else:
+        status_text += "Cloudinary not configured - files only saved to local (ephemeral) disk.\n"
 
     output_files = [r["output_path"] for r in results if r["success"]]
     zip_path = None
     if output_files:
-        zip_path = create_zip(f"batch_images_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip", output_files)
+        manifest_path = build_links_manifest(results)
+        zip_path = create_zip(
+            f"batch_images_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip",
+            output_files + ([manifest_path] if manifest_path else []),
+        )
         status_text += f"\nZIP ready for download ({len(output_files)} files).\n"
     else:
         status_text += "\nNo files were successfully processed - nothing to zip.\n"
 
     return status_text, zip_path
+
+
+# ==============================
+# CLOUD LIBRARY (browse what's stored in Cloudinary)
+# ==============================
+
+def fetch_cloud_library(max_results=30):
+    """
+    Lists the most recently uploaded videos and images from Cloudinary.
+    Returns an HTML fragment for display. Never raises - any failure
+    (including "not configured") renders as a friendly message instead.
+    """
+    if not CLOUDINARY_CONFIGURED:
+        return (
+            "<p>Cloudinary is not configured (missing CLOUDINARY_CLOUD_NAME / "
+            "CLOUDINARY_API_KEY / CLOUDINARY_API_SECRET environment variables). "
+            "Compressed files are only kept on local disk for this session.</p>"
+        )
+
+    rows = []
+    try:
+        for resource_type, folder, label in [
+            ("video", CLOUDINARY_VIDEO_FOLDER, "Video"),
+            ("image", CLOUDINARY_IMAGE_FOLDER, "Image"),
+        ]:
+            result = cloudinary.api.resources(
+                resource_type=resource_type,
+                type="upload",
+                prefix=folder,
+                max_results=max_results,
+                direction="desc",
+            )
+            for res in result.get("resources", []):
+                size_kb = res.get("bytes", 0) / 1024
+                size_display = f"{size_kb/1024:.2f} MB" if size_kb >= 1024 else f"{size_kb:.1f} KB"
+                created = res.get("created_at", "")
+                url = res.get("secure_url", "")
+                filename = Path(res.get("public_id", "")).name
+                rows.append((created, label, filename, size_display, url))
+    except Exception as e:
+        return f"<p>Could not reach Cloudinary: {str(e)}</p>"
+
+    if not rows:
+        return "<p>No files uploaded to Cloudinary yet. Compress something first!</p>"
+
+    rows.sort(key=lambda r: r[0], reverse=True)
+
+    html = "<table style='width:100%; border-collapse: collapse;'>"
+    html += (
+        "<tr>"
+        "<th style='text-align:left; padding:6px; border-bottom:1px solid #ccc;'>Type</th>"
+        "<th style='text-align:left; padding:6px; border-bottom:1px solid #ccc;'>File</th>"
+        "<th style='text-align:left; padding:6px; border-bottom:1px solid #ccc;'>Size</th>"
+        "<th style='text-align:left; padding:6px; border-bottom:1px solid #ccc;'>Uploaded</th>"
+        "<th style='text-align:left; padding:6px; border-bottom:1px solid #ccc;'>Link</th>"
+        "</tr>"
+    )
+    for created, label, filename, size_display, url in rows:
+        html += (
+            "<tr>"
+            f"<td style='padding:6px; border-bottom:1px solid #eee;'>{label}</td>"
+            f"<td style='padding:6px; border-bottom:1px solid #eee;'>{filename}</td>"
+            f"<td style='padding:6px; border-bottom:1px solid #eee;'>{size_display}</td>"
+            f"<td style='padding:6px; border-bottom:1px solid #eee;'>{created}</td>"
+            f"<td style='padding:6px; border-bottom:1px solid #eee;'><a href='{url}' target='_blank'>Open</a></td>"
+            "</tr>"
+        )
+    html += "</table>"
+    return html
 
 
 # ==============================
@@ -1057,6 +1263,23 @@ def create_ui():
                     fn=process_batch_images_ui,
                     inputs=[batch_image_files, batch_image_size_choice, batch_image_custom_kb],
                     outputs=[batch_image_status, batch_image_zip]
+                )
+
+            # ==================== TAB 5: CLOUD LIBRARY ====================
+            with gr.Tab("☁️ Cloud Library"):
+
+                gr.Markdown("""
+                Every compressed file is uploaded to Cloudinary for **permanent storage** -
+                local disk on a host like Render is wiped on every restart/redeploy, so this
+                is what survives. Browse and open past results here anytime.
+                """)
+
+                cloud_library_html = gr.HTML(value=fetch_cloud_library())
+                cloud_library_refresh_btn = gr.Button("🔄 Refresh", variant="secondary")
+
+                cloud_library_refresh_btn.click(
+                    fn=fetch_cloud_library,
+                    outputs=cloud_library_html
                 )
 
         return app
