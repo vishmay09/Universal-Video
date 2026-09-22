@@ -1078,19 +1078,22 @@ def fetch_cloud_library(max_results=30):
 # UI - GRADIO INTERFACE
 # ==============================
 
-def create_ui():
-    css = """
-    .header {
-        text-align: center;
-        padding: 16px;
-        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-        color: white;
-        border-radius: 10px;
-        margin-bottom: 16px;
-    }
-    """
+APP_CSS = """
+.header {
+    text-align: center;
+    padding: 16px;
+    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+    color: white;
+    border-radius: 10px;
+    margin-bottom: 16px;
+}
+"""
 
-    with gr.Blocks(title="Video & Image Compressor", theme=gr.themes.Soft(), css=css) as app:
+
+def create_ui():
+    # theme/css are passed to app.launch() instead of gr.Blocks() - Gradio
+    # 6.0 moved them there and deprecated passing them to the constructor.
+    with gr.Blocks(title="Video & Image Compressor") as app:
 
         gr.HTML("""
         <div class='header'>
@@ -1324,4 +1327,6 @@ if __name__ == "__main__":
         share=True,
         show_error=True,
         debug=not running_in_container,
+        theme=gr.themes.Soft(),
+        css=APP_CSS,
     )
