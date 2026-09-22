@@ -82,7 +82,25 @@ function previewSingleFile(drop, file, kind) {
 // ==============================
 // JOB POLLING
 // ==============================
+
+// A response body can be empty or non-JSON (a plain-text proxy error page,
+// or a connection cut off mid-response if the server process died at just
+// the wrong moment) even when fetch() itself succeeds - calling .json() on
+// that throws "Unexpected end of JSON input" and, uncaught, that raw
+// browser error is what the user sees instead of anything useful. Every
+// .json() call in this file goes through here so that failure always
+// becomes a clear message instead of a leaked parser exception.
+async function safeJson(res) {
+  try {
+    return await res.json();
+  } catch (e) {
+    return { detail: null, _parseFailed: true };
+  }
+}
+
 async function pollJob(jobId, { onProgress, onDone, onError }) {
+  let consecutiveBadResponses = 0;
+
   const poll = async () => {
     let res;
     try {
@@ -91,11 +109,27 @@ async function pollJob(jobId, { onProgress, onDone, onError }) {
       onError("Network error while checking job status.");
       return;
     }
-    if (!res.ok) {
-      onError("Job not found.");
+
+    if (res.status === 404) {
+      onError("Job not found (the server may have restarted).");
       return;
     }
-    const job = await res.json();
+
+    const job = await safeJson(res);
+
+    if (!res.ok || job._parseFailed) {
+      // A transient empty/invalid response (e.g. the server briefly
+      // restarting) shouldn't kill the whole poll loop immediately - only
+      // give up after a few in a row, so a one-off blip self-heals.
+      consecutiveBadResponses += 1;
+      if (consecutiveBadResponses >= 5) {
+        onError(`Lost contact with the server (HTTP ${res.status}). Please try again.`);
+        return;
+      }
+      setTimeout(poll, 1500);
+      return;
+    }
+    consecutiveBadResponses = 0;
 
     if (job.status === "running") {
       onProgress(job.progress || 0, job.desc || "");
@@ -162,8 +196,12 @@ document.getElementById("video-compress-btn").addEventListener("click", async ()
 
   try {
     const res = await fetch("/api/compress/video", { method: "POST", body: form });
-    if (!res.ok) throw new Error((await res.json()).detail || "Upload failed.");
-    const { job_id } = await res.json();
+    if (!res.ok) {
+      const errBody = await safeJson(res);
+      throw new Error(errBody.detail || `Upload failed (HTTP ${res.status}).`);
+    }
+    const { job_id } = await safeJson(res);
+    if (!job_id) throw new Error("Server response was invalid. Please try again.");
 
     pollJob(job_id, {
       onProgress: (frac, desc) => setProgress("video", true, frac, desc),
@@ -239,8 +277,12 @@ document.getElementById("image-compress-btn").addEventListener("click", async ()
 
   try {
     const res = await fetch("/api/compress/image", { method: "POST", body: form });
-    if (!res.ok) throw new Error((await res.json()).detail || "Upload failed.");
-    const { job_id } = await res.json();
+    if (!res.ok) {
+      const errBody = await safeJson(res);
+      throw new Error(errBody.detail || `Upload failed (HTTP ${res.status}).`);
+    }
+    const { job_id } = await safeJson(res);
+    if (!job_id) throw new Error("Server response was invalid. Please try again.");
 
     pollJob(job_id, {
       onProgress: (frac, desc) => setProgress("image", true, frac, desc),
@@ -321,8 +363,12 @@ function setupBatch(kind, unit) {
 
     try {
       const res = await fetch(`/api/compress/${kind}/batch`, { method: "POST", body: form });
-      if (!res.ok) throw new Error((await res.json()).detail || "Upload failed.");
-      const { job_id } = await res.json();
+      if (!res.ok) {
+        const errBody = await safeJson(res);
+        throw new Error(errBody.detail || `Upload failed (HTTP ${res.status}).`);
+      }
+      const { job_id } = await safeJson(res);
+      if (!job_id) throw new Error("Server response was invalid. Please try again.");
 
       pollJob(job_id, {
         onProgress: (frac, desc) => setProgress(`batch-${kind}`, true, frac, desc),
