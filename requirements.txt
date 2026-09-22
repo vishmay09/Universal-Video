@@ -1,5 +1,6 @@
-gradio==4.26.0
+gradio==4.44.1
 huggingface_hub<1.0
+starlette<1.0
 pillow==10.1.0
 cloudinary==1.40.0
 python-dotenv==1.0.1

@@ -1305,16 +1305,23 @@ if __name__ == "__main__":
     print("=" * 70 + "\n")
 
     # Render (and most container hosts) assign their own PORT and expect the
-    # app to bind every interface (0.0.0.0), not just localhost - and don't
-    # want Gradio's own public "share" tunnel since the host already
-    # provides a public URL. Running locally still gets a normal local
-    # server plus a temporary public share link for quick testing.
+    # app to bind every interface (0.0.0.0), not just localhost.
+    #
+    # share=True is required here even though Render already provides a
+    # public URL: Gradio's own startup self-check tries to confirm
+    # 127.0.0.1 is reachable, and inside a sandboxed container that check
+    # can fail - when it does, Gradio hard-crashes with "When localhost is
+    # not accessible, a shareable link must be created" unless share=True
+    # is set (this is Gradio's own documented behavior/workaround for
+    # server_name="0.0.0.0" in Docker, not something specific to this app).
+    # The share tunnel it creates is simply unused - Render's own URL is
+    # what people actually visit.
     running_in_container = bool(os.environ.get("PORT"))
 
     app.launch(
         server_name="0.0.0.0" if running_in_container else None,
         server_port=int(os.environ.get("PORT", 7860)),
-        share=not running_in_container,
+        share=True,
         show_error=True,
         debug=not running_in_container,
     )
