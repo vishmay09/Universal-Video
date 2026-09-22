@@ -76,6 +76,13 @@ for folder in [COMPRESSED_VIDEO_FOLDER, COMPRESSED_IMAGE_FOLDER, LOGS_FOLDER]:
 # ==============================
 # CONFIGURATION
 # ==============================
+
+# x264 "slow" gives the best quality-per-bit but is 2-4x slower than
+# "medium" - on a free-tier host's weak/shared CPU that difference is the
+# gap between "done in a couple minutes" and "looks hung for 20+". Quality
+# loss going to "medium" is minor; the reliability gain is not.
+VIDEO_ENCODE_PRESET = "medium"
+
 VIDEO_SIZE_PRESETS = {
     "Under 10 MB": 10,
     "Under 5 MB": 5,
@@ -354,6 +361,52 @@ def cleanup_passlog(passlog_base):
             pass
 
 
+def run_ffmpeg_with_progress(cmd, duration, progress_start, progress_span, progress_callback, desc_prefix, timeout=3600):
+    """
+    Runs an ffmpeg command (which must include "-progress pipe:1") and
+    reports live sub-progress instead of the caller's progress bar freezing
+    at one number for the whole duration of the pass. stderr is merged into
+    the same pipe as stdout (not read separately) specifically to avoid a
+    classic subprocess deadlock: ffmpeg writes a lot of its own log output
+    to stderr, and if that pipe fills up while we're only draining stdout,
+    ffmpeg blocks trying to write to it - which would also silently stop
+    the progress lines we're waiting for, hanging this function forever.
+    Returns (returncode, last ~4000 chars of output for error reporting).
+    """
+    process = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True, encoding="utf-8", errors="ignore",
+        bufsize=1,
+    )
+
+    output_tail = []
+    out_time_seconds = 0.0
+
+    for line in process.stdout:
+        output_tail.append(line)
+        if len(output_tail) > 200:
+            output_tail.pop(0)
+
+        line = line.strip()
+        if line.startswith("out_time_ms="):
+            try:
+                out_time_seconds = int(line.split("=", 1)[1]) / 1_000_000
+            except ValueError:
+                pass
+
+        if progress_callback and duration > 0:
+            frac = min(out_time_seconds / duration, 1.0)
+            try:
+                progress_callback(progress_start + progress_span * frac, desc=f"{desc_prefix} ({frac * 100:.0f}%)")
+            except Exception:
+                pass
+
+    process.wait(timeout=timeout)
+    return process.returncode, "".join(output_tail)[-4000:]
+
+
 def compress_video_to_target_size(input_path, output_path, target_size_mb, progress_callback=None):
     """
     Compresses input_path to output_path so the final file lands at or
@@ -390,32 +443,30 @@ def compress_video_to_target_size(input_path, output_path, target_size_mb, progr
             vf_parts.append("format=yuv420p")
             vf_filter = ",".join(vf_parts)
 
-            if progress_callback:
-                progress_callback(0.10 + 0.30 * (attempt - 1), desc=f"Pass 1/2 (attempt {attempt})")
+            attempt_start = 0.30 * (attempt - 1)
 
             pass1_cmd = [
-                FFMPEG_BIN, "-y",
+                FFMPEG_BIN, "-y", "-progress", "pipe:1", "-nostats",
                 "-i", str(input_path),
                 "-vf", vf_filter,
-                "-c:v", "libx264", "-preset", "slow",
+                "-c:v", "libx264", "-preset", VIDEO_ENCODE_PRESET,
                 "-b:v", f"{video_kbps}k",
                 "-pass", "1", "-passlogfile", str(passlog_base),
                 "-an", "-f", "null", NULL_DEVICE,
             ]
-            r1 = subprocess.run(pass1_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                 timeout=3600, **SUBPROCESS_TEXT_KWARGS)
+            code1, tail1 = run_ffmpeg_with_progress(
+                pass1_cmd, duration, attempt_start + 0.02, 0.13, progress_callback,
+                f"Pass 1/2 (attempt {attempt})",
+            )
 
-            if r1.returncode != 0:
-                return {"success": False, "error": f"Pass 1 failed: {r1.stderr[-800:]}"}
-
-            if progress_callback:
-                progress_callback(0.30 + 0.30 * (attempt - 1), desc=f"Pass 2/2 (attempt {attempt})")
+            if code1 != 0:
+                return {"success": False, "error": f"Pass 1 failed: {tail1}"}
 
             pass2_cmd = [
-                FFMPEG_BIN, "-y",
+                FFMPEG_BIN, "-y", "-progress", "pipe:1", "-nostats",
                 "-i", str(input_path),
                 "-vf", vf_filter,
-                "-c:v", "libx264", "-preset", "slow",
+                "-c:v", "libx264", "-preset", VIDEO_ENCODE_PRESET,
                 "-b:v", f"{video_kbps}k",
                 "-pass", "2", "-passlogfile", str(passlog_base),
                 "-c:a", "aac", "-b:a", f"{audio_kbps}k", "-ar", "48000",
@@ -423,11 +474,13 @@ def compress_video_to_target_size(input_path, output_path, target_size_mb, progr
                 "-movflags", "+faststart",
                 str(output_path),
             ]
-            r2 = subprocess.run(pass2_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                 timeout=3600, **SUBPROCESS_TEXT_KWARGS)
+            code2, tail2 = run_ffmpeg_with_progress(
+                pass2_cmd, duration, attempt_start + 0.16, 0.13, progress_callback,
+                f"Pass 2/2 (attempt {attempt})",
+            )
 
-            if r2.returncode != 0 or not output_path.exists():
-                return {"success": False, "error": f"Pass 2 failed: {r2.stderr[-800:]}"}
+            if code2 != 0 or not output_path.exists():
+                return {"success": False, "error": f"Pass 2 failed: {tail2}"}
 
             final_size = get_size_mb(output_path)
 
