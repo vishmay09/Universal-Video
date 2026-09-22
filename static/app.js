@@ -7,7 +7,6 @@ document.querySelectorAll(".tab-btn").forEach((btn) => {
     document.querySelectorAll(".tab-panel").forEach((p) => p.classList.remove("active"));
     btn.classList.add("active");
     document.getElementById(`tab-${btn.dataset.tab}`).classList.add("active");
-    if (btn.dataset.tab === "library") loadLibrary();
   });
 });
 
@@ -372,46 +371,3 @@ function setupBatch(kind, unit) {
 }
 setupBatch("video", "mb");
 setupBatch("image", "kb");
-
-// ==============================
-// CLOUD LIBRARY
-// ==============================
-async function loadLibrary() {
-  const content = document.getElementById("library-content");
-  content.innerHTML = "<p class='hint'>Loading...</p>";
-  try {
-    const res = await fetch("/api/library");
-    const data = await res.json();
-
-    if (!data.configured) {
-      content.innerHTML = "<p class='hint'>Cloudinary is not configured on this server.</p>";
-      return;
-    }
-    if (!data.items.length) {
-      content.innerHTML = "<p class='hint'>No files uploaded yet. Compress something first!</p>";
-      return;
-    }
-
-    const rows = data.items
-      .map((item) => {
-        const sizeKb = item.size_bytes / 1024;
-        const sizeDisplay = sizeKb >= 1024 ? `${(sizeKb / 1024).toFixed(2)} MB` : `${sizeKb.toFixed(1)} KB`;
-        return `<tr>
-          <td>${item.type}</td>
-          <td>${item.filename}</td>
-          <td>${sizeDisplay}</td>
-          <td>${item.created_at}</td>
-          <td><a href="${item.url}" target="_blank">Open ↗</a></td>
-        </tr>`;
-      })
-      .join("");
-
-    content.innerHTML = `<table class="lib-table">
-      <tr><th>Type</th><th>File</th><th>Size</th><th>Uploaded</th><th>Link</th></tr>
-      ${rows}
-    </table>`;
-  } catch (e) {
-    content.innerHTML = `<p class="hint">Could not load library: ${e.message}</p>`;
-  }
-}
-document.getElementById("library-refresh-btn").addEventListener("click", loadLibrary);

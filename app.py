@@ -17,6 +17,7 @@ unlike the multiple Gradio-specific container/proxy issues hit earlier in
 this project's history.
 """
 
+import json
 import os
 import shutil
 import threading
@@ -41,21 +42,43 @@ app.add_middleware(
 )
 
 # ==============================
-# IN-MEMORY JOB TRACKING
+# JOB TRACKING (in-memory + disk fallback)
 # ==============================
 # A job dict per compression run: {status, progress, desc, result, error}.
 # status is one of: "running", "done", "failed".
-# Jobs are ephemeral (lost on restart) by design - the actual compressed
-# files' permanent home is Cloudinary, not job history.
+#
+# Kept in memory for speed, but also mirrored to a small JSON file per job.
+# Reason: if the process restarts mid-job (e.g. an OOM kill from Render's
+# free-tier ~512MB RAM limit during a memory-heavy video encode - one
+# realistic cause of exactly that), the in-memory dict is wiped and every
+# poll afterward gets a bare 404 "Job not found", which looks like a
+# mystery bug rather than what actually happened. The on-disk copy lets a
+# poll after a restart still find the job and report a real status instead.
 
 JOBS = {}
 JOBS_LOCK = threading.Lock()
+JOBS_FOLDER = c.BASE_DIR / "Jobs"
+JOBS_FOLDER.mkdir(parents=True, exist_ok=True)
+
+
+def _job_file(job_id):
+    return JOBS_FOLDER / f"{job_id}.json"
+
+
+def _persist_job(job_id, job):
+    try:
+        with open(_job_file(job_id), "w", encoding="utf-8") as f:
+            json.dump(job, f)
+    except Exception:
+        pass  # persistence is a best-effort fallback, never block on it
 
 
 def new_job():
     job_id = uuid.uuid4().hex
+    job = {"status": "running", "progress": 0.0, "desc": "Starting...", "result": None, "error": None}
     with JOBS_LOCK:
-        JOBS[job_id] = {"status": "running", "progress": 0.0, "desc": "Starting...", "result": None, "error": None}
+        JOBS[job_id] = job
+    _persist_job(job_id, job)
     return job_id
 
 
@@ -68,6 +91,8 @@ def update_job(job_id, progress=None, desc=None):
             job["progress"] = progress
         if desc is not None:
             job["desc"] = desc
+        snapshot = dict(job)
+    _persist_job(job_id, snapshot)
 
 
 def finish_job(job_id, result):
@@ -77,6 +102,11 @@ def finish_job(job_id, result):
             job["status"] = "done"
             job["progress"] = 1.0
             job["result"] = result
+            snapshot = dict(job)
+        else:
+            snapshot = None
+    if snapshot:
+        _persist_job(job_id, snapshot)
 
 
 def fail_job(job_id, error):
@@ -85,6 +115,40 @@ def fail_job(job_id, error):
         if job:
             job["status"] = "failed"
             job["error"] = error
+            snapshot = dict(job)
+        else:
+            snapshot = None
+    if snapshot:
+        _persist_job(job_id, snapshot)
+
+
+def load_job(job_id):
+    """Checks memory first (fast path), falls back to the on-disk copy so a
+    job survives a process restart (e.g. an OOM kill mid-encode) instead of
+    every poll afterward getting a bare, unexplained 404."""
+    with JOBS_LOCK:
+        job = JOBS.get(job_id)
+        if job:
+            return dict(job)
+
+    try:
+        with open(_job_file(job_id), "r", encoding="utf-8") as f:
+            job = json.load(f)
+        if job.get("status") == "running":
+            # The job was mid-flight when this process (re)started - the
+            # thread that was updating it is gone, so it will never finish.
+            job["status"] = "failed"
+            job["error"] = (
+                "The server restarted while this job was running (most likely an "
+                "out-of-memory restart on this host during a memory-heavy encode). "
+                "Please try again - a shorter clip or a smaller target size uses "
+                "less memory and is less likely to hit this."
+            )
+        return job
+    except FileNotFoundError:
+        return None
+    except Exception:
+        return None
 
 
 def save_upload(upload_file: UploadFile) -> Path:
@@ -343,9 +407,8 @@ async def compress_image_batch(files: list[UploadFile] = File(...), size_choice:
 # ==============================
 
 @app.get("/api/jobs/{job_id}")
-async def get_job(job_id: str):
-    with JOBS_LOCK:
-        job = JOBS.get(job_id)
+async def get_job_route(job_id: str):
+    job = load_job(job_id)
     if not job:
         raise HTTPException(404, "Job not found.")
     return job
