@@ -11,10 +11,13 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-RUN mkdir -p video_processing_workspace1 && chmod -R 777 video_processing_workspace1
+RUN mkdir -p video_processing_workspace/Compressed_Videos \
+             video_processing_workspace/Compressed_Images \
+             video_processing_workspace/Logs && \
+    chmod -R 777 video_processing_workspace
 
 EXPOSE 7860
 
 ENV PORT=7860
 
-CMD ["python", "final1.py"]
+CMD ["python", "final.py"]
