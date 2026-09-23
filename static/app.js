@@ -98,10 +98,29 @@ async function safeJson(res) {
   }
 }
 
-async function pollJob(jobId, { onProgress, onDone, onError }) {
+// One poll loop per slot at a time. If a second job starts polling on the
+// same slot (e.g. the user clicks Compress again while a previous job -
+// possibly stuck retrying through a run of bad responses - is still
+// polling), the OLD loop is never explicitly told to stop and would keep
+// running forever alongside the new one. Every click before this fix could
+// leave one more orphaned polling loop running in the background, and
+// several retries in a row (exactly what repeated 502s invite someone to
+// do) compounds into many concurrent 1-request/second loops - plausibly
+// enough to trip a rate limit (an HTTP 429, which is what actually showed
+// up) even though each loop alone is modest. A monotonic token per slot
+// lets a stale loop recognize it's been superseded and quietly stop.
+const pollGeneration = {};
+
+async function pollJob(jobId, slot, { onProgress, onDone, onError }) {
+  const myGeneration = (pollGeneration[slot] = (pollGeneration[slot] || 0) + 1);
+  const isCurrent = () => pollGeneration[slot] === myGeneration;
+
   let consecutiveBadResponses = 0;
+  let backoffMs = 1500;
 
   const poll = async () => {
+    if (!isCurrent()) return; // superseded by a newer job on this slot
+
     let res;
     try {
       res = await fetch(`/api/jobs/${jobId}`);
@@ -110,30 +129,36 @@ async function pollJob(jobId, { onProgress, onDone, onError }) {
       return;
     }
 
+    if (!isCurrent()) return;
+
     if (res.status === 404) {
       onError("Job not found (the server may have restarted).");
       return;
     }
 
     const job = await safeJson(res);
+    if (!isCurrent()) return;
 
     if (!res.ok || job._parseFailed) {
       // A transient empty/invalid response (e.g. the server briefly
-      // restarting) shouldn't kill the whole poll loop immediately - only
-      // give up after a few in a row, so a one-off blip self-heals.
+      // restarting, or a rate limit) shouldn't kill the whole poll loop
+      // immediately - only give up after a few in a row, backing off each
+      // time so a struggling server gets fewer requests, not more.
       consecutiveBadResponses += 1;
       if (consecutiveBadResponses >= 5) {
         onError(`Lost contact with the server (HTTP ${res.status}). Please try again.`);
         return;
       }
-      setTimeout(poll, 1500);
+      setTimeout(poll, backoffMs);
+      backoffMs = Math.min(backoffMs * 1.7, 10000);
       return;
     }
     consecutiveBadResponses = 0;
+    backoffMs = 1500;
 
     if (job.status === "running") {
       onProgress(job.progress || 0, job.desc || "");
-      setTimeout(poll, 1000);
+      setTimeout(poll, 2000);
     } else if (job.status === "done") {
       onProgress(1, job.desc || "Done");
       onDone(job.result);
@@ -203,7 +228,7 @@ document.getElementById("video-compress-btn").addEventListener("click", async ()
     const { job_id } = await safeJson(res);
     if (!job_id) throw new Error("Server response was invalid. Please try again.");
 
-    pollJob(job_id, {
+    pollJob(job_id, "video", {
       onProgress: (frac, desc) => setProgress("video", true, frac, desc),
       onDone: (result) => {
         setProgress("video", false, 1, "");
@@ -284,7 +309,7 @@ document.getElementById("image-compress-btn").addEventListener("click", async ()
     const { job_id } = await safeJson(res);
     if (!job_id) throw new Error("Server response was invalid. Please try again.");
 
-    pollJob(job_id, {
+    pollJob(job_id, "image", {
       onProgress: (frac, desc) => setProgress("image", true, frac, desc),
       onDone: (result) => {
         setProgress("image", false, 1, "");
@@ -370,7 +395,7 @@ function setupBatch(kind, unit) {
       const { job_id } = await safeJson(res);
       if (!job_id) throw new Error("Server response was invalid. Please try again.");
 
-      pollJob(job_id, {
+      pollJob(job_id, `batch-${kind}`, {
         onProgress: (frac, desc) => setProgress(`batch-${kind}`, true, frac, desc),
         onDone: (result) => {
           setProgress(`batch-${kind}`, false, 1, "");
