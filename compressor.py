@@ -125,11 +125,27 @@ IMAGE_SIZE_PRESETS = {
 # Batch processing runs files through a bounded worker pool rather than
 # launching all of them at once - true unlimited parallelism (e.g. 100
 # simultaneous 2-pass ffmpeg encodes) would thrash CPU/RAM on any machine
-# and risk failures. Video encoding is CPU heavy so it gets a small pool;
-# image compression is light so it gets more.
-BATCH_VIDEO_MAX_WORKERS = max(1, min(3, os.cpu_count() or 2))
+# and risk failures. Image compression is light (pure PIL, no subprocess)
+# so it gets a real pool; video is capped at 1 (see VIDEO_ENCODE_SEMAPHORE
+# below) regardless of CPU count, since it's memory, not just CPU, that's
+# the constraint on a free-tier host.
+BATCH_VIDEO_MAX_WORKERS = 1
 BATCH_IMAGE_MAX_WORKERS = max(1, min(8, (os.cpu_count() or 4) * 2))
 MAX_BATCH_FILES = 100
+
+# Hard global cap: only one ffmpeg 2-pass video encode runs at a time,
+# process-wide, regardless of which code path asked for it (the single-
+# video API, or a batch worker thread). This is the actual reason a
+# hand-written thread-per-request backend can be less reliable than a
+# Gradio app on the exact same host and hardware: Gradio's own queue
+# serializes heavy requests by default, so it was never running more than
+# one encode at once even without anyone asking for that - our own
+# threading had no such limit, so multiple concurrent requests (a retry,
+# a double-click, a batch job overlapping a single-video one) could stack
+# up several ffmpeg processes at once, each with its own decode/encode
+# buffers - on a host with a hard ~512MB ceiling, that's a reliable way to
+# get OOM-killed even when any *one* of them alone would have fit.
+VIDEO_ENCODE_SEMAPHORE = threading.Semaphore(1)
 
 # ==============================
 # CLOUDINARY (PERSISTENT STORAGE)
@@ -540,104 +556,115 @@ def compress_video_to_target_size(input_path, output_path, target_size_mb, progr
 
     orig_w, orig_h = get_video_resolution(input_path)
 
-    passlog_base = Path(os.environ.get("TEMP", "/tmp")) / f"ff2pass_{datetime.now().strftime('%Y%m%d%H%M%S%f')}"
+    # Wait for exclusive access to the encoder before doing anything heavy -
+    # see VIDEO_ENCODE_SEMAPHORE for why this matters. If another encode is
+    # already running, this blocks here (no ffmpeg process exists yet, so
+    # nothing to time out) rather than starting a second one alongside it.
+    if progress_callback and VIDEO_ENCODE_SEMAPHORE._value < 1:
+        try:
+            progress_callback(0.0, desc="Waiting for another video to finish encoding first...")
+        except Exception:
+            pass
 
-    attempt_target = target_size_mb
-    max_attempts = 3
+    with VIDEO_ENCODE_SEMAPHORE:
+        passlog_base = Path(os.environ.get("TEMP", "/tmp")) / f"ff2pass_{datetime.now().strftime('%Y%m%d%H%M%S%f')}"
 
-    try:
-        for attempt in range(1, max_attempts + 1):
-            video_kbps, audio_kbps = estimate_target_bitrates(duration, attempt_target)
+        attempt_target = target_size_mb
+        max_attempts = 3
 
-            max_h = pick_max_height(video_kbps)
-            # Whichever cap is smaller wins - the bitrate-driven one (quality
-            # reasoning) or the hard decode-memory safety cap (reliability
-            # reasoning, independent of bitrate).
-            if orig_h and orig_h > MAX_SAFE_DECODE_HEIGHT:
-                max_h = min(max_h, MAX_SAFE_DECODE_HEIGHT) if max_h else MAX_SAFE_DECODE_HEIGHT
+        try:
+            for attempt in range(1, max_attempts + 1):
+                video_kbps, audio_kbps = estimate_target_bitrates(duration, attempt_target)
 
-            vf_parts = []
-            if max_h and orig_h and max_h < orig_h:
-                vf_parts.append(f"scale=-2:{max_h}")
-            vf_parts.append("format=yuv420p")
-            vf_filter = ",".join(vf_parts)
+                max_h = pick_max_height(video_kbps)
+                # Whichever cap is smaller wins - the bitrate-driven one
+                # (quality reasoning) or the hard decode-memory safety cap
+                # (reliability reasoning, independent of bitrate).
+                if orig_h and orig_h > MAX_SAFE_DECODE_HEIGHT:
+                    max_h = min(max_h, MAX_SAFE_DECODE_HEIGHT) if max_h else MAX_SAFE_DECODE_HEIGHT
 
-            attempt_start = 0.30 * (attempt - 1)
+                vf_parts = []
+                if max_h and orig_h and max_h < orig_h:
+                    vf_parts.append(f"scale=-2:{max_h}")
+                vf_parts.append("format=yuv420p")
+                vf_filter = ",".join(vf_parts)
 
-            pass1_cmd = [
-                FFMPEG_BIN, "-y", "-progress", "pipe:1", "-nostats",
-                "-threads", FFMPEG_THREAD_LIMIT,
-                "-i", str(input_path),
-                "-vf", vf_filter,
-                "-c:v", "libx264", "-preset", VIDEO_ENCODE_PRESET,
-                "-b:v", f"{video_kbps}k",
-                "-pass", "1", "-passlogfile", str(passlog_base),
-                "-an", "-f", "null", NULL_DEVICE,
-            ]
-            code1, tail1 = run_ffmpeg_with_progress(
-                pass1_cmd, duration, attempt_start + 0.02, 0.13, progress_callback,
-                f"Pass 1/2 (attempt {attempt})",
-            )
+                attempt_start = 0.30 * (attempt - 1)
 
-            if code1 != 0:
-                return {"success": False, "error": f"Pass 1 failed: {tail1}"}
-
-            pass2_cmd = [
-                FFMPEG_BIN, "-y", "-progress", "pipe:1", "-nostats",
-                "-threads", FFMPEG_THREAD_LIMIT,
-                "-i", str(input_path),
-                "-vf", vf_filter,
-                "-c:v", "libx264", "-preset", VIDEO_ENCODE_PRESET,
-                "-b:v", f"{video_kbps}k",
-                "-pass", "2", "-passlogfile", str(passlog_base),
-                "-c:a", "aac", "-b:a", f"{audio_kbps}k", "-ar", "48000",
-                "-pix_fmt", "yuv420p",
-                "-movflags", "+faststart",
-                str(output_path),
-            ]
-            code2, tail2 = run_ffmpeg_with_progress(
-                pass2_cmd, duration, attempt_start + 0.16, 0.13, progress_callback,
-                f"Pass 2/2 (attempt {attempt})",
-            )
-
-            if code2 != 0 or not output_path.exists():
-                return {"success": False, "error": f"Pass 2 failed: {tail2}"}
-
-            final_size = get_size_mb(output_path)
-
-            if final_size <= target_size_mb * 1.02 or attempt == max_attempts:
-                out_w, out_h = get_video_resolution(output_path)
-                safe_log(
-                    f"Compressed {input_path.name} -> {final_size:.2f} MB "
-                    f"(target {target_size_mb} MB, attempt {attempt})",
-                    "SUCCESS",
+                pass1_cmd = [
+                    FFMPEG_BIN, "-y", "-progress", "pipe:1", "-nostats",
+                    "-threads", FFMPEG_THREAD_LIMIT,
+                    "-i", str(input_path),
+                    "-vf", vf_filter,
+                    "-c:v", "libx264", "-preset", VIDEO_ENCODE_PRESET,
+                    "-b:v", f"{video_kbps}k",
+                    "-pass", "1", "-passlogfile", str(passlog_base),
+                    "-an", "-f", "null", NULL_DEVICE,
+                ]
+                code1, tail1 = run_ffmpeg_with_progress(
+                    pass1_cmd, duration, attempt_start + 0.02, 0.13, progress_callback,
+                    f"Pass 1/2 (attempt {attempt})",
                 )
-                return {
-                    "success": True,
-                    "size_mb": round(final_size, 2),
-                    "video_kbps": video_kbps,
-                    "audio_kbps": audio_kbps,
-                    "attempts": attempt,
-                    "original_resolution": f"{orig_w}x{orig_h}" if orig_w else "unknown",
-                    "output_resolution": f"{out_w}x{out_h}" if out_w else "unknown",
-                }
 
-            safe_log(
-                f"Compression attempt {attempt} overshot target "
-                f"({final_size:.2f} MB > {target_size_mb} MB), retrying tighter",
-                "INFO",
-            )
-            attempt_target = attempt_target * (target_size_mb / final_size) * 0.95
+                if code1 != 0:
+                    return {"success": False, "error": f"Pass 1 failed: {tail1}"}
 
-        return {"success": False, "error": "Could not converge under the target size."}
+                pass2_cmd = [
+                    FFMPEG_BIN, "-y", "-progress", "pipe:1", "-nostats",
+                    "-threads", FFMPEG_THREAD_LIMIT,
+                    "-i", str(input_path),
+                    "-vf", vf_filter,
+                    "-c:v", "libx264", "-preset", VIDEO_ENCODE_PRESET,
+                    "-b:v", f"{video_kbps}k",
+                    "-pass", "2", "-passlogfile", str(passlog_base),
+                    "-c:a", "aac", "-b:a", f"{audio_kbps}k", "-ar", "48000",
+                    "-pix_fmt", "yuv420p",
+                    "-movflags", "+faststart",
+                    str(output_path),
+                ]
+                code2, tail2 = run_ffmpeg_with_progress(
+                    pass2_cmd, duration, attempt_start + 0.16, 0.13, progress_callback,
+                    f"Pass 2/2 (attempt {attempt})",
+                )
 
-    except subprocess.TimeoutExpired:
-        return {"success": False, "error": "Compression timed out."}
-    except Exception as e:
-        safe_log(f"Compression error: {str(e)}", "ERROR")
-        return {"success": False, "error": str(e)}
-    finally:
-        cleanup_passlog(passlog_base)
+                if code2 != 0 or not output_path.exists():
+                    return {"success": False, "error": f"Pass 2 failed: {tail2}"}
+
+                final_size = get_size_mb(output_path)
+
+                if final_size <= target_size_mb * 1.02 or attempt == max_attempts:
+                    out_w, out_h = get_video_resolution(output_path)
+                    safe_log(
+                        f"Compressed {input_path.name} -> {final_size:.2f} MB "
+                        f"(target {target_size_mb} MB, attempt {attempt})",
+                        "SUCCESS",
+                    )
+                    return {
+                        "success": True,
+                        "size_mb": round(final_size, 2),
+                        "video_kbps": video_kbps,
+                        "audio_kbps": audio_kbps,
+                        "attempts": attempt,
+                        "original_resolution": f"{orig_w}x{orig_h}" if orig_w else "unknown",
+                        "output_resolution": f"{out_w}x{out_h}" if out_w else "unknown",
+                    }
+
+                safe_log(
+                    f"Compression attempt {attempt} overshot target "
+                    f"({final_size:.2f} MB > {target_size_mb} MB), retrying tighter",
+                    "INFO",
+                )
+                attempt_target = attempt_target * (target_size_mb / final_size) * 0.95
+
+            return {"success": False, "error": "Could not converge under the target size."}
+
+        except subprocess.TimeoutExpired:
+            return {"success": False, "error": "Compression timed out."}
+        except Exception as e:
+            safe_log(f"Compression error: {str(e)}", "ERROR")
+            return {"success": False, "error": str(e)}
+        finally:
+            cleanup_passlog(passlog_base)
 
 
 # ==============================
