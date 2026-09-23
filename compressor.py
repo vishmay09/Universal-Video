@@ -91,11 +91,26 @@ for folder in [COMPRESSED_VIDEO_FOLDER, COMPRESSED_IMAGE_FOLDER, LOGS_FOLDER, UP
 # CONFIGURATION
 # ==============================
 
-# x264 "slow" gives the best quality-per-bit but is 2-4x slower than
-# "medium" - on a free-tier host's weak/shared CPU that difference is the
-# gap between "done in a couple minutes" and "looks hung for 20+". Quality
-# loss going to "medium" is minor; the reliability gain is not.
-VIDEO_ENCODE_PRESET = "medium"
+# x264 "slow"/"medium" give better quality-per-bit but use meaningfully
+# more memory (larger lookahead/reference-frame buffers) and CPU than
+# "faster" - on a free-tier host with a hard ~512MB RAM ceiling shared by
+# the OS, Python, and the ffmpeg subprocess together, that's the
+# difference between "completes" and "the whole container gets OOM-killed
+# mid-encode". Quality loss going to "faster" is modest; reliability on a
+# genuinely memory-constrained host is not something quality can trade for.
+VIDEO_ENCODE_PRESET = "faster"
+
+# Independent of the bitrate-driven output resolution below: decoding a
+# very large source (e.g. 4K phone video) is itself memory-heavy regardless
+# of what resolution it gets encoded back out at, so very large sources are
+# always pre-capped before any encoding is attempted.
+MAX_SAFE_DECODE_HEIGHT = 1920
+
+# Bounds ffmpeg's own worker-thread count. Left unset, ffmpeg sizes its
+# thread pool off the container's *reported* CPU count, which on a shared
+# host can be higher than what it's actually allotted - more threads each
+# holding their own encode buffers is more peak memory, not just more CPU.
+FFMPEG_THREAD_LIMIT = "2"
 
 VIDEO_SIZE_PRESETS = {
     "10mb": 10,
@@ -534,8 +549,14 @@ def compress_video_to_target_size(input_path, output_path, target_size_mb, progr
         for attempt in range(1, max_attempts + 1):
             video_kbps, audio_kbps = estimate_target_bitrates(duration, attempt_target)
 
-            vf_parts = []
             max_h = pick_max_height(video_kbps)
+            # Whichever cap is smaller wins - the bitrate-driven one (quality
+            # reasoning) or the hard decode-memory safety cap (reliability
+            # reasoning, independent of bitrate).
+            if orig_h and orig_h > MAX_SAFE_DECODE_HEIGHT:
+                max_h = min(max_h, MAX_SAFE_DECODE_HEIGHT) if max_h else MAX_SAFE_DECODE_HEIGHT
+
+            vf_parts = []
             if max_h and orig_h and max_h < orig_h:
                 vf_parts.append(f"scale=-2:{max_h}")
             vf_parts.append("format=yuv420p")
@@ -545,6 +566,7 @@ def compress_video_to_target_size(input_path, output_path, target_size_mb, progr
 
             pass1_cmd = [
                 FFMPEG_BIN, "-y", "-progress", "pipe:1", "-nostats",
+                "-threads", FFMPEG_THREAD_LIMIT,
                 "-i", str(input_path),
                 "-vf", vf_filter,
                 "-c:v", "libx264", "-preset", VIDEO_ENCODE_PRESET,
@@ -562,6 +584,7 @@ def compress_video_to_target_size(input_path, output_path, target_size_mb, progr
 
             pass2_cmd = [
                 FFMPEG_BIN, "-y", "-progress", "pipe:1", "-nostats",
+                "-threads", FFMPEG_THREAD_LIMIT,
                 "-i", str(input_path),
                 "-vf", vf_filter,
                 "-c:v", "libx264", "-preset", VIDEO_ENCODE_PRESET,
